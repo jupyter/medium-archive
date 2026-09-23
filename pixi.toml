@@ -33,6 +33,8 @@ mdit-py-plugins = "*"
 pygments = "*"
 pyyaml = "*"
 pillow = "*"
+# caps the frame rate of a gif the pelican site stores as a gif
+numpy = "*"
 # resizes gifs kept as gifs (site.toml animated_format = "gif")
 gifsicle = "*"
 # the tests: pytest, and jinja2 to render the pelican theme's pages
@@ -65,5 +67,8 @@ solve-walls = ["solve-walls"]
 test = "pytest -q"
 pagefind = "python -m pagefind"
 build-hugo = { cmd = "medium-archive hugo && cd site-hugo && hugo && python -m pagefind --site public", description = "Export and build the Hugo site into site-hugo/public/" }
-build-pelican = { cmd = "medium-archive pelican && cd site-pelican && pelican && python -m pagefind --site output", description = "Export and build the Pelican site into site-pelican/output/" }
+# The Pelican site stores each animation as an AV1 master and its build
+# makes the h264 it serves from it; that h264 is cached beside the
+# exporter's copies in .image-cache/, which CI restores.
+build-pelican = { cmd = "medium-archive pelican && cd site-pelican && pelican && python -m pagefind --site output", env = { CLIP_CACHE = "$PIXI_PROJECT_ROOT/.image-cache/clips" }, description = "Export and build the Pelican site into site-pelican/output/" }
 build-myst = { cmd = "medium-archive myst && cd site-myst && myst build --html", description = "Export and build the MyST site into site-myst/_build/html/" }

@@ -89,8 +89,9 @@ pixi run -e solve-walls medium-archive fetch URL --solve-walls
 The site exporters place every animated gif as an H.264 clip with a
 webp poster, and stop with an error when they cannot (see
 [Images](#images)). Building a site from an archive with animated gifs
-therefore requires Pillow and an `ffmpeg` built with libx264 and
-libwebp, unless `site.toml` sets `[images] animated_format = "gif"`.
+therefore requires Pillow and an `ffmpeg` built with libx264, libaom
+(the Pelican site's AV1 masters) and libwebp, unless `site.toml` sets
+`[images] animated_format = "gif"`.
 The other tools are needed only for the step that uses them. The pixi
 environment has all of them, at the versions `pixi.toml` pins.
 
@@ -297,6 +298,16 @@ filesystems):
   ffmpeg failing) stops the build with an error listing every such gif,
   unless `site.toml` asks for gifs (`animated_format = "gif"`). The
   measurements behind these choices are in `docs/gif-intermediates.md`.
+- The Pelican site stores one master of each animation, frame-rate
+  capped and at full size: the smaller of two lossless copies (the gif
+  re-optimized by gifsicle `-O3`, or animated lossless WebP), or an
+  AV1 4:4:4 CRF 28 master where that is at most 75% of the lossless
+  copy (`master_max_share`). Its build makes the h264 it serves from
+  the master, with the settings above, cached under `$CLIP_CACHE`
+  (`.image-cache/clips/` in the pixi task). A site kept as its own
+  repository then holds one small copy of each animation that any
+  later format can be made from. `[images] clip_master = "none"`
+  stores the h264 clip instead.
 
 Configure with `site.toml`'s `[images]` table: `still_max_edge`,
 `animated_max_edge` (0, the default for animations, disables the cap), `animated_format` (`"mp4"` or

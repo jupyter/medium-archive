@@ -2089,12 +2089,290 @@ def test_animated_gifs_placed_as_video(tmp_path):
         assert im.size == (1600, 1200)     # the gif's own size
     page = (site / "content/posts/2022/picture-post/index.md").read_text()
     assert "![a screen recording](images/anim.mp4)" in page
-    # built once and shared: the pelican site links the same clip and
-    # the same poster
+
+
+def has_encoder(name):
+    """Whether the ffmpeg on PATH lists the encoder `name`."""
+    import shutil
+    import subprocess
+    if not shutil.which("ffmpeg"):
+        return False
+    return f" {name} " in subprocess.run(
+        ["ffmpeg", "-hide_banner", "-encoders"],
+        capture_output=True, text=True).stdout
+
+
+def video_stream(path):
+    """codec, pixel format, width and height of a clip's video, and its
+    length in ms."""
+    import subprocess
+    probe = json.loads(subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=codec_name,pix_fmt,width,height"
+         ":format=duration", "-of", "json", str(path)],
+        capture_output=True, text=True, check=True).stdout)
+    v = probe["streams"][0]
+    return (v["codec_name"], v["pix_fmt"], v["width"], v["height"],
+            round(float(probe["format"]["duration"]) * 1000))
+
+
+# a site.toml that stores every animation as its AV1 master
+ALWAYS_MASTER = {"images": {"master_max_share": 1000}}
+
+needs_av1_and_h264 = pytest.mark.skipif(
+    not (has_encoder("libaom-av1") and has_encoder("libx264")
+         and __import__("shutil").which("ffprobe")),
+    reason="ffmpeg with libaom and libx264 not installed")
+
+
+def make_clip_post(tmp_path, config=None):
+    """An archive whose one post carries one animated gif of an odd
+    size with uneven delays, and the site.toml `config` (title added)."""
+    manifest = {}
+    make_post(tmp_path, manifest, "clip-post", "ddd444ddd444",
+              "2022-06-01T10:00:00Z",
+              "![a screen recording](images/anim.gif)\n",
+              images=["images/anim.gif"])
+    img_dir = archive_dir(tmp_path) / "posts/2022-06-01-clip-post/images"
+    img_dir.mkdir()
+    delays = [590, 750, 300, 450, 120, 870, 330, 1010]
+    animation(img_dir / "anim.gif",
+              [gradient_frame((201, 151), i * 9) for i in range(8)],
+              duration=delays)
+    manifest_json(tmp_path).write_text(json.dumps(manifest))
+    write_site(tmp_path, {"title": "Clips", **(config or {})})
+    return img_dir / "anim.gif", delays
+
+
+@needs_av1_and_h264
+def test_the_pelican_site_stores_av1_masters_of_its_clips(tmp_path):
+    """The pelican site keeps an animation as the AV1 4:4:4 master its
+    build makes the served h264 from: under the clip's name, at the
+    gif's own size (4:4:4 needs no padding), as long as the gif, and
+    with the poster the served clip will have, padded to its even
+    size. The hugo site, which serves what it stores, keeps h264.
+    (master_max_share stores the master whatever the lossless copies
+    weigh, since this is what is being tested.)"""
+    from PIL import Image
+
+    gif, delays = make_clip_post(tmp_path, ALWAYS_MASTER)
+    images = "content/posts/2022/clip-post/images"
     pelican_site = build(pelican, tmp_path)
+    master = pelican_site / images / "anim.mp4"
+    assert video_stream(master) == ("av1", "yuv444p", 201, 151, sum(delays))
+    with Image.open(pelican_site / images / "anim-poster.webp") as im:
+        assert im.size == (202, 152)
+    page = (pelican_site / "content/posts/2022/clip-post/index.md").read_text()
+    assert "![a screen recording]({attach}images/anim.mp4)" in page
+
+    hugo_site = build(hugo, tmp_path)
+    assert video_stream(hugo_site / images / "anim.mp4")[:2] == (
+        "h264", "yuv420p")
+
+
+@needs_av1_and_h264
+def test_the_pelican_build_serves_h264_made_from_each_master(
+        tmp_path, monkeypatch, capsys):
+    """What a pelican build copies into output/ is the master; the site
+    plugin replaces it with the h264 every browser decodes in hardware,
+    padded to an even size and as long as the gif, and keeps that h264
+    by the master's hash, so the next build encodes nothing."""
+    import shutil
+
+    gif, delays = make_clip_post(tmp_path, ALWAYS_MASTER)
+    site = build(pelican, tmp_path)
+    master = site / "content/posts/2022/clip-post/images/anim.mp4"
+    output = tmp_path / "output"
+    served = output / "posts/2022/clip-post/images/anim.mp4"
+    served.parent.mkdir(parents=True)
+    monkeypatch.setenv("CLIP_CACHE", str(tmp_path / "clips"))
+    serve = config_namespace(site)["_serve_clips"]
+
+    for encoded in (1, 0):
+        shutil.copyfile(master, served)          # as pelican copies it
+        serve(SimpleNamespace(output_path=str(output)))
+        assert video_stream(served) == ("h264", "yuv420p", 202, 152,
+                                        sum(delays))
+        assert f"({encoded} encoded)" in capsys.readouterr().out
+    assert master.read_bytes() != served.read_bytes()
+
+
+@needs_av1_and_h264
+def test_a_pelican_site_can_store_h264_instead(tmp_path, monkeypatch,
+                                               capsys):
+    """clip_master = "none" stores the h264 clip the other sites carry,
+    the very file, and the build serves it as it is."""
+    make_clip_post(tmp_path, {"images": {"clip_master": "none"}})
+    images = "content/posts/2022/clip-post/images"
+    pelican_site = build(pelican, tmp_path)
+    hugo_site = build(hugo, tmp_path)
     for name in ("anim.mp4", "anim-poster.webp"):
-        assert (pelican_site / "content/posts/2022/picture-post/images" / name
-                ).stat().st_ino == (placed / name).stat().st_ino
+        assert (pelican_site / images / name).stat().st_ino == (
+            hugo_site / images / name).stat().st_ino
+    output = tmp_path / "output"
+    served = output / "posts/2022/clip-post/images/anim.mp4"
+    served.parent.mkdir(parents=True)
+    stored = (pelican_site / images / "anim.mp4").read_bytes()
+    served.write_bytes(stored)
+    monkeypatch.setenv("CLIP_CACHE", str(tmp_path / "clips"))
+    config_namespace(pelican_site)["_serve_clips"](
+        SimpleNamespace(output_path=str(output)))
+    assert served.read_bytes() == stored
+    assert "0 served as h264" in capsys.readouterr().out
+
+
+@needs_av1_and_h264
+def stored_lossless(images):
+    """The one lossless copy of `anim` a site stores: gif or WebP."""
+    found = [p for p in images.iterdir()
+             if p.name in ("anim.gif", "anim.webp")]
+    assert len(found) == 1, found
+    return found[0]
+
+
+@needs_av1_and_h264
+def test_a_pelican_site_stores_a_lossless_copy_where_a_master_does_not_pay(
+        tmp_path, monkeypatch, capsys):
+    """Where the AV1 master is not enough smaller than the smaller of
+    the capped gif and the capped lossless WebP (master_max_share; 0
+    here, so never), the site stores that copy -- frame for frame the
+    animation's -- with the clip's poster beside it, and the page
+    points at it. The build makes the h264 beside it and shows that as
+    the page's <video>; the copy stays for the feeds."""
+    from PIL import Image, ImageChops
+
+    gif, delays = make_clip_post(tmp_path, {"images": {"master_max_share": 0}})
+    site = build(pelican, tmp_path)
+    images = site / "content/posts/2022/clip-post/images"
+    stored = stored_lossless(images)
+    assert (images / "anim-poster.webp").exists()
+    assert not (images / "anim.mp4").exists()
+    page = (site / "content/posts/2022/clip-post/index.md").read_text()
+    assert f"![a screen recording]({{attach}}images/{stored.name})" in page
+    with Image.open(gif) as before, Image.open(stored) as after:
+        assert after.n_frames == before.n_frames
+        for i in range(before.n_frames):
+            before.seek(i)
+            after.seek(i)
+            after.load()             # WebP sets a frame's duration then
+            assert after.info["duration"] == delays[i]
+            assert not ImageChops.difference(
+                before.convert("RGB"), after.convert("RGB")).getbbox()
+
+    # the build, as pelican runs it: the stored files copied into the
+    # output, the page rendered with the gif as a body image
+    output = tmp_path / "output"
+    served = output / "posts/2022/clip-post/images"
+    served.mkdir(parents=True)
+    for f in images.iterdir():
+        (served / f.name).write_bytes(f.read_bytes())
+    page = output / "posts/2022/clip-post/index.html"
+    page.write_text(f'<p><img src="/posts/2022/clip-post/images/{stored.name}" '
+                    'alt="a screen recording" data-body-image '
+                    'loading="lazy"></p>\n')
+    monkeypatch.setenv("CLIP_CACHE", str(tmp_path / "clips"))
+    namespace = config_namespace(site)
+    namespace["_serve_clips"](SimpleNamespace(output_path=str(output)))
+    assert ("0 served as h264 made from AV1 masters and 1 from gifs and "
+            "WebPs") in capsys.readouterr().out
+    assert video_stream(served / "anim.mp4") == ("h264", "yuv420p", 202, 152,
+                                                 sum(delays))
+    assert (served / stored.name).exists()
+    namespace["_optimize_article_images"](
+        SimpleNamespace(output_path=str(output)))
+    html = page.read_text()
+    assert '<video src="/posts/2022/clip-post/images/anim.mp4"' in html
+    assert 'poster="/posts/2022/clip-post/images/anim-poster.webp"' in html
+    assert "<img" not in html
+
+
+@needs_av1_and_h264
+@pytest.mark.parametrize("kind", ["gif", "webp"])
+def test_a_lossless_copy_is_frame_rate_capped_exactly(tmp_path, kind):
+    """A lossless copy stored in place of a master, gif or WebP, drops
+    the frames a clip drops (kept_frames), and keeps every other one
+    pixel for pixel, each from its own start until the next kept
+    frame's -- the gif written whole, since dropping a frame breaks the
+    partial frames after it."""
+    from PIL import Image, ImageChops
+
+    src = tmp_path / "src"
+    src.mkdir()
+    delays = [10] * 12 + [500, 10, 10, 10, 400]
+    gif = animation(src / "burst.gif",
+                    [gradient_frame((96, 64), i * 7)
+                     for i in range(len(delays))], duration=delays)
+    keep = sites.kept_frames(delays)
+    assert len(keep) < len(delays)
+    placer = sites.ImagePlacer(tmp_path / "cache",
+                               {"images": {"master_max_share": 0}},
+                               masters=True)
+    out = tmp_path / "out"
+    out.mkdir()
+    placer.place(gif, out / "burst.gif")
+    stored = next(placer.cache.glob(f"*.capped.{kind}"))
+    assert stored.stat().st_size
+    assert sites.poster_path(stored).exists()
+    starts = [sum(delays[:i]) for i in range(len(delays) + 1)]
+    ends = keep[1:] + [len(delays)]
+    with Image.open(gif) as before, Image.open(stored) as after:
+        assert after.n_frames == len(keep)
+        for j, (i, end) in enumerate(zip(keep, ends)):
+            before.seek(i)
+            after.seek(j)
+            after.load()             # WebP sets a frame's duration then
+            assert after.info["duration"] == starts[end] - starts[i]
+            assert not ImageChops.difference(
+                before.convert("RGB"), after.convert("RGB")).getbbox()
+
+
+def test_a_webp_that_cannot_win_is_not_made(tmp_path):
+    """The WebP is the slow candidate, so it is made only where it could
+    be stored: not where the master is at most master_max_share of
+    WEBP_MIN_SHARE of the capped gif. Nothing is cached for it then, so
+    a larger share makes it on the next lookup."""
+    placer = sites.ImagePlacer(tmp_path / "cache", {}, masters=True)
+    master, gif = tmp_path / "m.mp4", tmp_path / ("x" + sites.CAPPED_GIF_SUFFIX)
+    gif.write_bytes(b"g" * 1000)
+    bound = sites.MASTER_MAX_SHARE * sites.WEBP_MIN_SHARE * 1000
+    master.write_bytes(b"m" * int(bound))
+    assert placer._webp_cannot_win(master, [gif])
+    master.write_bytes(b"m" * (int(bound) + 1))
+    assert not placer._webp_cannot_win(master, [gif])
+    # no capped gif to bound it by: the WebP is made
+    assert not placer._webp_cannot_win(master, [])
+    # a site that always stores the lossless copy (share 0) makes it too
+    always = sites.ImagePlacer(tmp_path / "cache",
+                               {"images": {"master_max_share": 0}},
+                               masters=True)
+    assert not always._webp_cannot_win(master, [gif])
+
+
+def test_an_unknown_clip_master_is_an_error(tmp_path):
+    with pytest.raises(ValueError, match="clip_master"):
+        sites.ImagePlacer(tmp_path, {"images": {"clip_master": "vp9"}},
+                          masters=True)
+    # a site that does not store masters does not read the key
+    sites.ImagePlacer(tmp_path, {"images": {"clip_master": "vp9"}})
+
+
+def test_a_clip_master_needs_an_ffmpeg_with_libaom(tmp_path):
+    """An ffmpeg that cannot write AV1 cannot make the master, and says
+    so rather than failing inside ffmpeg."""
+    src = tmp_path / "src"
+    src.mkdir()
+    gif = animation(src / "anim.gif",
+                    [gradient_frame((64, 48), i * 9) for i in range(4)])
+    build = tmp_path / "ffmpeg"                  # one without libaom
+    build.write_text("#!/bin/sh\necho ' V....D libx264   H.264'\n"
+                     "echo ' V....D libwebp   WebP'\n")
+    build.chmod(0o755)
+    placer = sites.ImagePlacer(tmp_path / "cache", {}, masters=True)
+    placer.ffmpeg = str(build)
+    out = tmp_path / "out"
+    out.mkdir()
+    with pytest.raises(sites.AnimationError, match="without libaom"):
+        placer.place(gif, out / "anim.gif")
 
 
 @pytest.mark.skipif(not __import__("shutil").which("gifsicle"),
@@ -2247,11 +2525,35 @@ def test_an_ffmpeg_without_libwebp_says_so(tmp_path):
         placer.place(gif, out / "clip.gif")
 
 
+def test_a_single_frame_gif_is_placed_as_a_png_would_be(tmp_path):
+    """A gif of one frame is a still under a .gif name: line art becomes
+    lossless webp, every pixel kept, as a line-art PNG does -- in every
+    site, the pelican site too, and without ffmpeg."""
+    from PIL import Image, ImageChops
+
+    src = tmp_path / "src"
+    src.mkdir()
+    still = src / "chart.gif"
+    line_art(1200, 500).convert("P").save(still)
+    for masters in (False, True):
+        placer = sites.ImagePlacer(tmp_path / "cache", {}, masters=masters)
+        placer.ffmpeg = None
+        out = tmp_path / f"out-{masters}"
+        out.mkdir()
+        placed = placer.place(still, out / "chart.gif")
+        assert placed == out / "chart.webp"
+        assert placed.stat().st_size < still.stat().st_size
+        assert not sites.poster_path(placed).exists()
+        with Image.open(still) as before, Image.open(placed) as after:
+            assert not ImageChops.difference(
+                before.convert("RGB"), after.convert("RGB")).getbbox()
+
+
 def test_an_animation_without_ffmpeg_is_an_error(tmp_path):
     """Where clips are asked for, an animated gif that cannot become one
     stops the build: no ffmpeg is an error, not a note. A still under a
-    .gif name is not an animation and is placed as it is, and a site
-    that asks for gifs keeps them without ffmpeg."""
+    .gif name is not an animation and needs no ffmpeg, and a site that
+    asks for gifs keeps them without ffmpeg."""
     from PIL import Image
 
     src = tmp_path / "src"
@@ -2267,7 +2569,7 @@ def test_an_animation_without_ffmpeg_is_an_error(tmp_path):
     placer.ffmpeg = None
     with pytest.raises(sites.AnimationError, match="ffmpeg is not installed"):
         placer.place(moving, out / "moving.gif")
-    assert placer.place(still, out / "still.gif") == out / "still.gif"
+    assert placer.place(still, out / "still.gif").stem == "still"
 
     as_gifs = sites.ImagePlacer(tmp_path / "cache",
                                 {"images": {"animated_format": "gif"}})

@@ -585,6 +585,59 @@ STILL_EXTS = (".png", ".jpg", ".jpeg", ".webp")
 ANIMATED_FORMAT = "mp4"
 VIDEO_CRF = 24
 VIDEO_PRESET = "slower"
+# A site that encodes its own clips when it is built -- the pelican
+# site, whose plugin makes the served h264 from what the site stores --
+# stores a master instead: AV1 in 4:4:4 color, frame-rate capped like
+# a clip, at the gif's own size. A site checked in as a repository of
+# its own keeps its media for good, and a format change later would
+# otherwise mean committing a second copy of every clip. The master is
+# what every later format is made from: 4:4:4 keeps the colored text,
+# 1-pixel lines and dither that 4:2:0 loses, at about the bytes of
+# today's h264 (docs/gif-intermediates.md: libaom 4:4:4 CRF 28 came to
+# 27% of the gifs against h264 CRF 24's 28%, at 47.6 dB against 36.6).
+# It is not served itself: browsers decode AV1 4:4:4 in software, if at
+# all, where 4:2:0 h264 has a hardware decoder everywhere, and a clip
+# loops for as long as it is on screen. CRF 28 is the step under the
+# CRF 34 at which small text first showed artifacts in 4:4:4. Against
+# CRF 24 on the archive's ten largest gifs it stored 29% less for about
+# 1.5 dB, and the h264 made from either came out within 0.3 dB: the
+# 4:2:0 encode loses far more than the master does. -cpu-used 6 was as
+# small as 4 and far faster. site.toml's clip_master = "none" stores
+# the h264 clip instead, and master_crf moves the CRF.
+CLIP_MASTER = "av1"
+CLIP_MASTERS = ("av1", "none")
+MASTER_CRF = 28
+# The master is lossy, so it is stored only where it pays: where it is
+# at most this share of the smallest lossless copy of the animation,
+# frame-rate capped the way a clip is -- the gif re-optimized by
+# gifsicle -O3, or lossless WebP, which codes a screencast with video
+# in it better than gif can (73-150% of the gif on the largest four in
+# docs/gif-intermediates.md). Elsewhere that lossless copy is what the
+# site stores, pixel for pixel: clean screen recordings that change a
+# few pixels a frame are what gif codes best, and a master of one can
+# come out larger than the gif. Either way the site serves h264 made
+# from what it stores, and the poster travels beside it.
+# site.toml's master_max_share moves the line (1 stores the smallest,
+# 0 always a lossless copy); every candidate is cached, so a new line
+# re-encodes nothing.
+MASTER_MAX_SHARE = 0.75
+CAPPED_GIF_SUFFIX = ".capped.gif"
+CAPPED_WEBP_SUFFIX = ".capped.webp"
+# Lossless WebP through Pillow, the writer that keeps each delay as
+# given (gif2webp plays 10 ms as 100), at cwebp's default effort
+# (method 4, quality 75; Pillow's own default for an animation is
+# method 0) rather than the method 6 and quality 100
+# docs/gif-intermediates.md measured: those are libwebp's slowest, and
+# the WebP only decides what is stored for a handful of gifs, where
+# the extra effort saved little.
+# It is by far the slowest candidate -- hours for the archive, where
+# the capped gif takes seconds a gif -- so it is only built where it
+# could be stored: in the first full export's 113 WebPs, none came in
+# under 44% of its capped gif, so where the master is at most master_max_share
+# of this share of the capped gif, the master wins whatever the WebP
+# would weigh, and the WebP is not made.
+WEBP_LOSSLESS = {"lossless": True, "quality": 75, "method": 4}
+WEBP_MIN_SHARE = 0.4
 # The still a clip carries, beside it under this suffix. It is what a
 # gif showed at rest (the clip's own first frame, so nothing jumps when
 # playback starts), what a reduced-motion reader sees instead of
@@ -704,6 +757,75 @@ def select_frames(keep: list[int]) -> str:
     return "select='" + tree([f"between(n,{a},{b})" for a, b in runs]) + "'"
 
 
+class _TooManyColors(Exception):
+    pass
+
+
+class _KeptFrames:
+    """The kept frames of an open gif as P images, each composited and
+    given a palette of exactly its own colors, made one at a time as
+    Pillow's writer asks for them (a long recording held whole runs to
+    gigabytes). Iterable more than once, as the writer needs."""
+
+    def __init__(self, im, keep):
+        self.im, self.keep = im, keep
+
+    def __iter__(self):
+        import numpy as np
+        from PIL import Image
+        for i in self.keep:
+            self.im.seek(i)
+            rgb = np.asarray(self.im.convert("RGB"))
+            flat = rgb.reshape(-1, 3).astype(np.uint32)
+            key = flat[:, 0] << 16 | flat[:, 1] << 8 | flat[:, 2]
+            colors, index = np.unique(key, return_inverse=True)
+            if len(colors) > 256:
+                raise _TooManyColors(i)
+            frame = Image.fromarray(
+                index.reshape(rgb.shape[:2]).astype(np.uint8), "P")
+            palette = np.stack([colors >> 16, colors >> 8 & 255,
+                                colors & 255], 1).astype(np.uint8)
+            frame.putpalette(palette.ravel().tolist())
+            yield frame
+
+
+class _RGBFrames:
+    """The kept frames of an open gif, composited to RGB one at a time
+    as Pillow's writer asks for them. Iterable more than once."""
+
+    def __init__(self, im, keep):
+        self.im, self.keep = im, keep
+
+    def __iter__(self):
+        for i in self.keep:
+            self.im.seek(i)
+            yield self.im.convert("RGB")
+
+
+def write_kept_frames(src: Path, dst: str, delays, keep) -> bool:
+    """The frames of the gif src that keep lists, written to dst as a
+    gif of whole frames, each shown from its own start until the next
+    kept frame's. False, with nothing left at dst, when a kept frame
+    has more than 256 colors and so cannot be written exactly."""
+    import itertools
+
+    from PIL import Image
+
+    starts = [0, *itertools.accumulate(delays)]
+    ends = keep[1:] + [len(delays)]
+    durations = [starts[b] - starts[a] for a, b in zip(keep, ends)]
+    with Image.open(src) as im:
+        try:
+            first = next(iter(_KeptFrames(im, keep[:1])))
+            first.save(dst, save_all=True,
+                       append_images=_KeptFrames(im, keep[1:]),
+                       duration=durations, loop=0, optimize=False)
+        except _TooManyColors:
+            Path(dst).unlink(missing_ok=True)
+            return False
+    return True
+
+
 def transparent_first_frame(im) -> bool:
     """Whether a gif is really see-through where a page shows it. Gif
     uses its transparent index to mean "unchanged since the previous
@@ -773,9 +895,15 @@ class ImagePlacer:
     extension when the copy changed format -- the exporters rewrite
     their pages' image references from it. A clip's poster is placed
     beside it under the name poster_path() gives, which is how the hugo
-    and pelican themes find it."""
+    and pelican themes find it.
 
-    def __init__(self, cache: Path, config: dict):
+    masters=True is for a site that encodes its served clips itself
+    when it is built: an animation's .mp4 is then the AV1 4:4:4 master
+    that site makes them from (see CLIP_MASTER), unless site.toml's
+    clip_master turns that off. Its poster is the one the clip would
+    have, at the size of the h264 served."""
+
+    def __init__(self, cache: Path, config: dict, masters: bool = False):
         images = config.get("images", {})
         self.still_cap = images.get("still_max_edge", STILL_MAX_EDGE) or 0
         self.gif_cap = images.get("animated_max_edge", ANIMATED_MAX_EDGE) or 0
@@ -783,6 +911,19 @@ class ImagePlacer:
                                 or ANIMATED_FORMAT).lower()
         self.video_crf = images.get("video_crf", VIDEO_CRF)
         self.video_preset = images.get("video_preset", VIDEO_PRESET)
+        self.master = (str(images.get("clip_master") or CLIP_MASTER).lower()
+                       if masters else "none")
+        if self.master not in CLIP_MASTERS:
+            raise ValueError(f"site.toml [images] clip_master: "
+                             f"{self.master!r} is not one of "
+                             + ", ".join(map(repr, CLIP_MASTERS)))
+        self.master_crf = images.get("master_crf", MASTER_CRF)
+        self.master_max_share = images.get("master_max_share",
+                                           MASTER_MAX_SHARE)
+        # a master is cached beside the clips and the stills, which the
+        # sites share, under a name carrying its own settings
+        self.clip_suffix = (f".av1444-{self.master_crf}.mp4"
+                            if self.master == "av1" else ".mp4")
         # the encode settings name the cache directory beside the caps:
         # they decide what a clip comes out as, the way a cap does
         video = (f"-mp4{self.video_crf}-{self.video_preset}"
@@ -793,7 +934,7 @@ class ImagePlacer:
         self.gifsicle = shutil.which("gifsicle")
         self.ffmpeg = (shutil.which("ffmpeg")
                        if self.animated_format == "mp4" else None)
-        self.ffmpeg_webp = None            # asked once, on the first clip
+        self.ffmpeg_encoders = None        # asked once, on the first clip
         try:
             from PIL import Image
             self.pillow = Image
@@ -880,14 +1021,20 @@ class ImagePlacer:
         cached as a link to the source, which reads back as that same
         None -- the verdict is remembered, not recomputed."""
         ext = src.suffix.lower()
+        if (ext == ".gif" and self.master == "av1"
+                and self.animated_format == "mp4"):
+            copy = self._stored_animation(src)
+            if copy is not NotImplemented:
+                return copy
         if ext == ".gif":
-            # the extensions an animation's copy can carry, newest
-            # scheme first: a clip in .mp4, and a resized gif -- or the
-            # verdict that neither paid off -- under .gif. Which of the
-            # two is built is decided on a cache miss, inside
+            # the extensions a gif's copy can carry, newest scheme
+            # first: a clip in .mp4, a still's webp or jpg, and a
+            # resized gif -- or the verdict that none paid off -- under
+            # .gif. Which is built is decided on a cache miss, inside
             # _place_animation: reading a gif's frames to find out
             # whether it can become a clip costs more than the lookup
-            cap, candidates = self.gif_cap, (".mp4", ext)
+            cap = self.gif_cap
+            candidates = (self.clip_suffix, ".webp", ".jpg", ext)
             if self.animated_format == "mp4":
                 build = self._place_animation
             elif self._resizes_gif(src, cap):
@@ -930,7 +1077,8 @@ class ImagePlacer:
         if not built:
             discard_copy(tmp)
             return None
-        if built != ".mp4" and os.path.getsize(tmp) >= src.stat().st_size:
+        if (built != self.clip_suffix
+                and os.path.getsize(tmp) >= src.stat().st_size):
             discard_copy(tmp)              # the copy did not pay off
             built = ext                    # cache the verdict all the same
             cached = self.cache / f"{digest}{built}"
@@ -950,9 +1098,146 @@ class ImagePlacer:
         """Whether a display copy is placed at all: it has to undercut
         what it replaces -- except a clip, which is placed for the pause
         control it gives a reader whatever it weighs (see
-        ANIMATED_FORMAT)."""
-        return (copy.suffix == ".mp4"
+        ANIMATED_FORMAT), and a capped gif stored with its poster for a
+        site to make its clip from (see MASTER_MAX_SHARE)."""
+        return (copy.suffix == ".mp4" or poster_path(copy).exists()
                 or copy.stat().st_size < src.stat().st_size)
+
+    def _stored_animation(self, src: Path):
+        """For a site that stores masters: the cached AV1 master of an
+        animated gif, or the smaller of its capped gif and capped
+        lossless WebP where the master does not undercut that by enough
+        (see MASTER_MAX_SHARE) -- each with the clip's poster beside it.
+        All three are built on first sight and cached, and the choice is
+        made on every lookup. NotImplemented for a still under a .gif
+        name, which takes the usual path."""
+        digest = hashlib.sha256(src.read_bytes()).hexdigest()[:16]
+        master = self.cache / f"{digest}{self.clip_suffix}"
+        delays = None
+        if not master.exists():
+            delays = self._clip_delays(src)
+            if not delays:
+                return NotImplemented
+            self._cache_build(master, lambda tmp: self._encode_video(
+                src, tmp, self.gif_cap, delays))
+        lossless = []
+        for suffix, write in ((CAPPED_GIF_SUFFIX, self._capped_gif),
+                              (CAPPED_WEBP_SUFFIX, self._capped_webp)):
+            copy = self.cache / f"{digest}{suffix}"
+            if (write == self._capped_webp and not copy.exists()
+                    and self._webp_cannot_win(master, lossless)):
+                continue
+            if not copy.exists():
+                delays = delays or self._clip_delays(src)
+
+                def build(tmp, write=write):
+                    write(src, tmp, delays)
+                    link_or_copy(poster_path(master), poster_path(Path(tmp)))
+                self._cache_build(copy, build)
+            if copy.stat().st_size:     # 0: no exact copy of this kind
+                lossless.append(copy)
+        best = min(lossless, key=lambda p: p.stat().st_size, default=None)
+        if best and (master.stat().st_size
+                     > self.master_max_share * best.stat().st_size):
+            return best
+        return master
+
+    def _webp_cannot_win(self, master: Path, lossless) -> bool:
+        """Whether the AV1 master is already small enough that no WebP
+        could be stored instead: a WebP is at least WEBP_MIN_SHARE of
+        the capped gif, so where the master is at most master_max_share
+        of that, the master is stored whatever the WebP weighs. The
+        WebP is the slow candidate by far, and this skips most of them.
+        Nothing is cached for a skipped WebP, so a larger
+        master_max_share builds it on the next lookup."""
+        gif = next((p for p in lossless
+                    if p.name.endswith(CAPPED_GIF_SUFFIX)), None)
+        return gif is not None and (
+            master.stat().st_size
+            <= self.master_max_share * WEBP_MIN_SHARE * gif.stat().st_size)
+
+    def _cache_build(self, cached: Path, build):
+        """Run build(tmp) into a temporary file in the cache and move
+        what it wrote -- and the poster beside it, first, since the
+        cached file is found by its own name -- under cached's name."""
+        self.cache.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=self.cache, suffix=".gif")
+        os.close(fd)
+        try:
+            build(tmp)
+        except BaseException:
+            discard_copy(tmp)
+            raise
+        poster = poster_path(Path(tmp))
+        if poster.exists():
+            os.replace(poster, poster_path(cached))
+        os.replace(tmp, cached)
+
+    def _capped_webp(self, src: Path, tmp: str, delays):
+        """The frames kept_frames keeps as lossless WebP, each composited
+        and held from its own start until the next kept frame's. An
+        empty file -- the verdict that none exists -- where a kept frame
+        would last 10 ms or less, which ffmpeg's WebP decoder and
+        browsers play as 100 ms, or where animated_max_edge shrinks the
+        gif (a resampled frame gains the colors lossless pays for)."""
+        import itertools
+
+        keep = kept_frames(delays)
+        starts = [0, *itertools.accumulate(delays)]
+        ends = keep[1:] + [len(delays)]
+        durations = [starts[b] - starts[a] for a, b in zip(keep, ends)]
+        size = self._probe(src)
+        if (min(durations) <= 10 or size is None
+                or video_size(size, self.gif_cap) != tuple(size)):
+            Path(tmp).write_bytes(b"")
+            return
+        with self.pillow.open(src) as im:
+            im.seek(keep[0])
+            first = im.convert("RGB")
+            first.save(tmp, format="WEBP", save_all=True,
+                       append_images=_RGBFrames(im, keep[1:]),
+                       duration=durations, loop=0, **WEBP_LOSSLESS)
+
+    def _capped_gif(self, src: Path, tmp: str, delays):
+        """The gif with the frames kept_frames keeps, each at its own
+        start and holding over the frames dropped after it, re-optimized
+        losslessly by gifsicle -O3 and never larger than the gif itself
+        when no frame is dropped. Dropping a frame breaks the partial
+        frames after it, and gifsicle cannot unoptimize a gif with
+        per-frame color tables, so there each kept frame is composited
+        by Pillow and written whole with a palette of exactly its own
+        colors. That is exact only when no frame has more than 256
+        colors; a gif that has one gets an empty file, the verdict that
+        no capped gif exists. (docs/gif-intermediates/fpscap.py --gif,
+        which this follows, was checked exact on the archive.)"""
+        keep = kept_frames(delays)
+        source, written = src, None
+        if len(keep) < len(delays):
+            written = tmp + ".frames.gif"
+            try:
+                if not write_kept_frames(src, written, delays, keep):
+                    Path(tmp).write_bytes(b"")
+                    return
+            except ImportError as e:
+                raise AnimationError(
+                    f"{src.name}: numpy is not installed, and capping a "
+                    "gif's frame rate needs it (pip install numpy)") from e
+            source = Path(written)
+        try:
+            run = None
+            if self.gifsicle:
+                resize = (["--resize-fit", f"{self.gif_cap}x{self.gif_cap}"]
+                          if self.gif_cap else [])
+                run = subprocess.run(
+                    [self.gifsicle, "--no-conserve-memory", "-O3", *resize,
+                     str(source), "-o", tmp], capture_output=True, text=True)
+            if run is None or run.returncode or not os.path.getsize(tmp):
+                shutil.copyfile(source, tmp)
+            if source == src and os.path.getsize(tmp) > src.stat().st_size:
+                shutil.copyfile(src, tmp)
+        finally:
+            if written:
+                Path(written).unlink(missing_ok=True)
 
     def _probe(self, src: Path):
         """(width, height), by header sniff or Pillow, else None."""
@@ -970,12 +1255,15 @@ class ImagePlacer:
 
     def _place_animation(self, src: Path, tmp: str, cap: int):
         """A gif's display copy where this archive places animations as
-        video: the clip, or for a still under a .gif name the resized
-        gif gifsicle makes of it, or nothing. An animation that cannot
-        become a clip raises AnimationError."""
+        video: the clip, or for a still under a .gif name what a PNG
+        becomes -- lossless webp for line art, the photo path for a
+        photograph (see _copy_png), with the still cap -- or nothing.
+        An animation that cannot become a clip raises AnimationError."""
         delays = self._clip_delays(src)
         if delays:
             return self._encode_video(src, tmp, cap, delays)
+        if self.still_cap:
+            return self._copy_png(src, tmp, self.still_cap)
         return (self._resize_gif(src, tmp, cap)
                 if self._resizes_gif(src, cap) else None)
 
@@ -1019,18 +1307,29 @@ class ImagePlacer:
                 "built with libwebp (the ffmpeg package on Debian, "
                 "Ubuntu and Homebrew is), or set [images] "
                 'animated_format = "gif" in site.toml to keep gifs')
+        if self.master == "av1" and not self._has_encoder("libaom-av1"):
+            raise AnimationError(
+                f"{src.name}: {self.ffmpeg} was built without libaom, "
+                "which the AV1 master this site stores needs. Install "
+                "an ffmpeg built with libaom (pixi.toml's is), or set "
+                '[images] clip_master = "none" in site.toml to store '
+                "h264 clips")
         return delays
 
     def _writes_webp(self) -> bool:
         """Whether this ffmpeg can write a clip's poster. Most builds
         carry libwebp; one that does not fails with "Encoder not found",
         which is worth saying plainly rather than as an ffmpeg error."""
-        if self.ffmpeg_webp is None:
+        return self._has_encoder("libwebp")
+
+    def _has_encoder(self, name: str) -> bool:
+        """Whether this ffmpeg lists the encoder `name`, asked once."""
+        if self.ffmpeg_encoders is None:
             run = subprocess.run([self.ffmpeg, "-hide_banner", "-loglevel",
                                   "error", "-encoders"],
                                  capture_output=True, text=True)
-            self.ffmpeg_webp = " libwebp " in (run.stdout or "")
-        return self.ffmpeg_webp
+            self.ffmpeg_encoders = run.stdout or ""
+        return f" {name} " in self.ffmpeg_encoders
 
     def _encode_video(self, src: Path, tmp: str, cap: int, delays):
         """The gif's frames as h264 in mp4, and its first frame beside
@@ -1049,23 +1348,39 @@ class ImagePlacer:
         the muxer no durations, and the mp4 then ends at the last
         frame's decode time -- 27 of the archive's clips came out
         short, one by 1.55 s of the 2.64 s its gif holds near the end.
-        Raises AnimationError when ffmpeg fails."""
+
+        Where the site stores a master (see CLIP_MASTER), the mp4 is
+        AV1 4:4:4 from libaom instead, with the same frames and
+        timestamps, and without the padding: 4:4:4 has no even-size
+        rule, and the h264 the site makes from the master pads it
+        then. The poster is padded all the same, to the size of that
+        h264. Raises AnimationError when ffmpeg fails."""
         size = self._probe(src)
         if size is None:
             raise AnimationError(f"cannot read the size of {src.name}")
         width, height = video_size(size, cap)
-        shape = ([] if (width, height) == tuple(size)
-                 else [f"scale={width}:{height}:flags=lanczos"]) + [EVEN_PAD]
+        scale = ([] if (width, height) == tuple(size)
+                 else [f"scale={width}:{height}:flags=lanczos"])
+        shape = scale + [EVEN_PAD]
         keep = kept_frames(delays)
         select = [select_frames(keep)] if len(keep) < len(delays) else []
         poster = poster_path(Path(tmp))
+        if self.master == "av1":
+            frames = select + scale
+            codec = ["-c:v", "libaom-av1", "-pix_fmt", "yuv444p",
+                     "-crf", str(self.master_crf), "-cpu-used", "6",
+                     "-g", "9999", "-row-mt", "0"]
+        else:
+            frames = select + shape
+            codec = ["-c:v", "libx264", "-profile:v", "high",
+                     "-pix_fmt", "yuv420p", "-crf", str(self.video_crf),
+                     "-preset", str(self.video_preset), "-bf", "0"]
         run = subprocess.run(
             [self.ffmpeg, "-nostdin", "-loglevel", "error", "-y",
-             "-i", str(src),
-             "-vf", ",".join(select + shape),
-             "-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p",
-             "-crf", str(self.video_crf), "-preset", str(self.video_preset),
-             "-threads", "1", "-bf", "0",
+             "-i", str(src)]
+            + (["-vf", ",".join(frames)] if frames else [])
+            + codec +
+            ["-threads", "1",
              "-fps_mode", "passthrough", "-enc_time_base", "1:1000",
              "-an", "-movflags", "+faststart", "-f", "mp4", tmp,
              "-map", "0:v", "-vf", ",".join(shape), "-frames:v", "1",
@@ -1076,7 +1391,7 @@ class ImagePlacer:
             detail = (run.stderr or "").strip().splitlines()
             raise AnimationError(f"ffmpeg failed on {src.name}"
                                  + (f": {detail[-1]}" if detail else ""))
-        return ".mp4"
+        return self.clip_suffix
 
     def _resizes_gif(self, src: Path, cap: int) -> bool:
         """Whether gifsicle has anything to do for this gif."""

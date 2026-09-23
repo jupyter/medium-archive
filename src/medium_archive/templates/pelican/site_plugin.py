@@ -173,6 +173,126 @@ def _clip(src, path, attrs, output_path, here):
             % (src, extra, ' aria-label="%s"' % label if label else ""))
 
 
+# An animation is stored under content/ as one of two things, and what
+# a browser is served is h264 made from it here, on every build: the
+# AV1 4:4:4 master of its clip (<name>.mp4), or -- where no master
+# undercut it by enough -- a lossless copy, frame-rate capped, as gif
+# or as animated WebP, which the clip's poster beside it
+# (<name>-poster.webp) marks as an animation to serve this way; its
+# page then shows <name>.mp4 as a <video>, and the gif or WebP stays
+# for the feeds, which carry the page as written. 4:2:0 h264 plays everywhere, on a hardware decoder, where
+# AV1 4:4:4 plays in some browsers and in software. These are the
+# settings the archive's exporter encodes the h264 clips of its other
+# sites with (medium_archive's sites.ImagePlacer), less the frame
+# selection, which what is stored already carries: each frame keeps
+# its timestamp on a millisecond time base, an odd size is padded by a
+# pixel, one thread per encode, and no B-frames, without which the mp4
+# runs as long as the gif. An .mp4 that is not AV1 -- a site exported
+# with clip_master = "none" -- is served as it is.
+CLIP_H264 = ["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+             "-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p",
+             "-crf", "24", "-preset", "slower", "-threads", "1", "-bf", "0",
+             "-fps_mode", "passthrough", "-enc_time_base", "1:1000",
+             "-an", "-movflags", "+faststart", "-f", "mp4"]
+# The h264 made from each stored animation is kept by that file's
+# content hash, under this name for the settings above -- change it
+# with them -- in $CLIP_CACHE, or cache/clips/ beside this config.
+CLIP_SCHEME = "h264-crf24-slower"
+# what an animation stored losslessly can be; one is an animation
+# when its poster is beside it
+ANIMATION_SUFFIXES = (".gif", ".webp")
+
+
+def _serve_clips(pelican_obj):
+    # Make the h264 of every stored animation Pelican copied into the
+    # output -- over an AV1 master, beside a gif -- encoding the ones
+    # not yet cached in parallel. One that cannot be made stops the
+    # build, as an animation that cannot become a clip stops the
+    # export: an AV1 4:4:4 file would not play in Safari at all, and a
+    # gif cannot be paused.
+    import glob
+    import hashlib
+    import os
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+    from concurrent.futures import ThreadPoolExecutor
+
+    posts = os.path.join(pelican_obj.output_path, "posts")
+    gifs = [g for ext in ANIMATION_SUFFIXES
+            for g in glob.glob(os.path.join(posts, "**", "*" + ext),
+                               recursive=True)
+            if os.path.exists(os.path.splitext(g)[0] + POSTER_SUFFIX)]
+    from_gifs = {os.path.splitext(g)[0] + ".mp4" for g in gifs}
+    # (what is stored, where its h264 goes)
+    jobs = sorted([(m, m) for m in glob.glob(os.path.join(posts, "**", "*.mp4"),
+                                             recursive=True)
+                   if m not in from_gifs]
+                  + [(g, os.path.splitext(g)[0] + ".mp4") for g in gifs])
+    if not jobs:
+        return
+    here = os.path.dirname(os.path.abspath(__file__))
+    cache = os.path.join(os.environ.get("CLIP_CACHE")
+                         or os.path.join(here, "cache", "clips"), CLIP_SCHEME)
+    os.makedirs(cache, exist_ok=True)
+    ffmpeg, ffprobe = shutil.which("ffmpeg"), shutil.which("ffprobe")
+
+    def serve(job):
+        # what became of it: "made" (from the cache), "encoded",
+        # "as stored", or why it could not be served
+        src, dst = job
+        with open(src, "rb") as fh:
+            digest = hashlib.file_digest(fh, "sha256").hexdigest()[:16]
+        made = os.path.join(cache, digest + ".mp4")
+        # the verdict that an .mp4 is served as it is, remembered too
+        stored = os.path.join(cache, digest + ".as-stored")
+        if os.path.exists(stored):
+            return "as stored"
+        outcome = "made"
+        if not os.path.exists(made):
+            if not (ffmpeg and ffprobe):
+                return "%s: ffmpeg is not installed" % src
+            if src == dst:
+                probe = subprocess.run(
+                    [ffprobe, "-v", "error", "-select_streams", "v:0",
+                     "-show_entries", "stream=codec_name", "-of", "csv=p=0",
+                     src], capture_output=True, text=True)
+                if probe.stdout.strip() != "av1":
+                    open(stored, "w").close()
+                    return "as stored"
+            fd, tmp = tempfile.mkstemp(dir=cache, suffix=".mp4")
+            os.close(fd)
+            run = subprocess.run(
+                [ffmpeg, "-nostdin", "-loglevel", "error", "-y",
+                 "-i", src] + CLIP_H264 + [tmp],
+                capture_output=True, text=True)
+            if run.returncode or not os.path.getsize(tmp):
+                os.unlink(tmp)
+                detail = (run.stderr or "").strip().splitlines()
+                return "%s: ffmpeg failed%s" % (
+                    src, ": " + detail[-1] if detail else "")
+            os.replace(tmp, made)
+            outcome = "encoded"
+        shutil.copyfile(made, dst)
+        return outcome
+
+    with ThreadPoolExecutor(os.cpu_count() or 1) as pool:
+        outcomes = list(pool.map(serve, jobs))
+    failed = [o for o in outcomes if ": " in o]
+    if failed:
+        sys.exit("%d animation(s) could not be made into h264 clips "
+                 "(the site's clips need ffmpeg with libx264):\n%s"
+                 % (len(failed), "\n".join(failed)))
+    served = [(src, o) for (src, _), o in zip(jobs, outcomes)
+              if o != "as stored"]
+    print("clips: %d served as h264 made from AV1 masters and %d from "
+          "gifs and WebPs (%d encoded), %d as stored"
+          % (sum(s.endswith(".mp4") for s, _ in served),
+             sum(not s.endswith(".mp4") for s, _ in served),
+             outcomes.count("encoded"), outcomes.count("as stored")))
+
+
 def _optimize_article_images(pelican_obj):
     # Rewrite marked body images on post pages: add width/height, add
     # srcset variants for photographs, turn clips into <video>, and
@@ -207,6 +327,14 @@ def _optimize_article_images(pelican_obj):
             return bare
         if path.lower().endswith(VIDEO_SUFFIXES):
             return _clip(src, path, attrs, pelican_obj.output_path, here)
+        if path.lower().endswith(ANIMATION_SUFFIXES):
+            # an animation stored as a gif or WebP: its clip is the h264
+            # _serve_clips made beside it (a still has none)
+            clip = os.path.splitext(path)[0] + ".mp4"
+            if os.path.exists(os.path.join(pelican_obj.output_path,
+                                           *clip.lstrip("/").split("/"))):
+                return _clip(os.path.splitext(src)[0] + ".mp4", clip, attrs,
+                             pelican_obj.output_path, here)
         parts = path.lstrip("/").split("/")
         local = os.path.join(pelican_obj.output_path, *parts)
         # encode from and cache against the content-side original:
@@ -390,6 +518,8 @@ class _SitePlugins:
         signals.article_generator_finalized.connect(_relate_articles)
         signals.article_generator_finalized.connect(_collect_sitemap)
         signals.finalized.connect(_prioritize_first_images)
+        # the clips first: a gif's page shows the clip made beside it
+        signals.finalized.connect(_serve_clips)
         signals.finalized.connect(_optimize_article_images)
         signals.finalized.connect(_write_redirects)
         signals.finalized.connect(_write_crawl_files)

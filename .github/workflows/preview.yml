@@ -105,16 +105,18 @@ jobs:
           EOF
           )
           # the builds of the programs that encode the copies, as
-          # pixi.lock pins them: a new ffmpeg, x264, libwebp, Pillow
-          # or gifsicle can change every copy, where a lock change
-          # elsewhere (a test dependency) changes none
+          # pixi.lock pins them: a new ffmpeg, x264, libaom (the pelican
+          # site's AV1 masters), libwebp, Pillow or gifsicle can change
+          # every copy, where a lock change elsewhere (a test
+          # dependency) changes none
           tools=$(pixi list --json | pixi run python -c '
           import hashlib, json, sys
           pins = sorted("=".join((p["name"], p["version"], p.get("build", "")))
                         for p in json.load(sys.stdin)
-                        if p["name"] in ("ffmpeg", "x264", "libwebp-base",
-                                         "pillow", "gifsicle"))
-          assert len(pins) == 5, pins
+                        if p["name"] in ("ffmpeg", "x264", "aom",
+                                         "libwebp-base", "pillow",
+                                         "gifsicle"))
+          assert len(pins) == 6, pins
           print(hashlib.sha256(" ".join(pins).encode()).hexdigest()[:12])')
           # and the archive those copies are made from -- a tree lookup
           # rather than a hash of 2114 files, and it moves for an image
@@ -175,13 +177,15 @@ jobs:
           # .pixi too: setup-pixi saved its cache when it installed
           rm -rf .git .pixi archive/raw archive/posts site-myst site-hugo site-pelican
           # and, from the cache this run may be about to save, every
-          # scheme directory but the one it filled: a cache restored
-          # across a scheme change carries the generation before it, and
-          # a full set of display copies is re-uploaded and restored on
-          # every run for as long as the key keeps hitting.
+          # scheme directory but the one it filled and clips/, the h264
+          # the pelican build made from its AV1 masters (named by its
+          # settings inside): a cache restored across a scheme change
+          # carries the generation before it, and a full set of display
+          # copies is re-uploaded and restored on every run for as long
+          # as the key keeps hitting.
           if [ -d .image-cache ]; then
             find .image-cache -mindepth 1 -maxdepth 1 -type d \
-                 ! -name "$SCHEME" -exec rm -rf {} +
+                 ! -name "$SCHEME" ! -name clips -exec rm -rf {} +
           fi
 
       - name: Upload Pages artifact

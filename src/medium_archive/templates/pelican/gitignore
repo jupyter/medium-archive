@@ -3,5 +3,7 @@
 
 __pycache__/
 
-# Pelican's content cache, when LOAD_CONTENT_CACHE is turned on.
+# Pelican's content cache, when LOAD_CONTENT_CACHE is turned on, and
+# cache/clips/: the h264 the site plugin makes from each animation's
+# AV1 master, unless $CLIP_CACHE puts it elsewhere.
 /cache/

@@ -125,13 +125,21 @@ hubspot_region = "na1"
 # are the ffmpeg settings, whose defaults were measured on this
 # archive's screencasts (docs/gif-intermediates.md). Unset, the
 # defaults are 1600 (still), 0 (animated: no cap), "mp4", 24 and
-# "slower".
+# "slower". The pelican site stores a master of each animation
+# instead, and its build makes the h264 from it (see sites.CLIP_MASTER
+# and MASTER_MAX_SHARE): the smaller of the frame-rate-capped gif and
+# lossless WebP, or an AV1 4:4:4 master at master_crf (default 28)
+# where that is at most master_max_share (default 0.75) of it.
+# clip_master = "none" stores the h264 clip there too.
 # [images]
 # still_max_edge = 1600
 # animated_max_edge = 0
 # animated_format = "mp4"
 # video_crf = 24
 # video_preset = "slower"
+# clip_master = "av1"
+# master_crf = 28
+# master_max_share = 0.75
 
 # Anything only the hugo site should differ in: "locale", and the image
 # keys ("avatar", "logo", "logo_dark", "favicon"), each overriding the

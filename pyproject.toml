@@ -20,8 +20,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# card-cover thumbnails in the hugo and pelican exporters
-covers = ["pillow"]
+# card-cover thumbnails in the hugo and pelican exporters, and the
+# animations: numpy writes the frame-rate-capped gifs the pelican site
+# stores where an AV1 master does not pay
+covers = ["pillow", "numpy"]
 # fetch --solve-walls: a real browser for a human to clear a bot wall's
 # interactive challenge by hand; still needs `playwright install chromium`
 solve-walls = ["playwright"]

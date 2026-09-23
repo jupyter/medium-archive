@@ -92,6 +92,20 @@ generated at export time when Pillow is installed (`pip install
 pillow`), center-cropped or letterboxed by aspect ratio (see
 sites.make_cover_thumbnail); without it, cards use the full-size image.
 
+An animation is stored as a master, beside the clip's poster: the
+smaller of its frame-rate-capped gif and lossless WebP, or the AV1
+4:4:4 master of its clip where that saves enough (see
+sites.CLIP_MASTER and MASTER_MAX_SHARE). The site plugin makes the
+h264 a browser is served from it on every build, and the page shows
+that as a <video>: the site keeps one file per animation that every later
+format can be made from, and a format change is a change to the plugin
+rather than a new copy of every clip in the site's history. Building
+the site therefore needs ffmpeg with libx264. The h264 is cached by the
+master's content hash under cache/clips/ in the site, or under
+$CLIP_CACHE (the archive's pixi task points it into .image-cache/).
+site.toml's [images] clip_master = "none" stores the h264 clips the
+other sites carry instead, which the plugin serves as they are.
+
 Pelican has no built-in equivalent of Hugo's aliases, so the
 generated config embeds a small plugin (templates/pelican/site_plugin.py,
 appended verbatim): after each build it reads the exported redirects.csv
@@ -225,7 +239,7 @@ def build_site(archive: Path, out=None, inputs=DEFAULT_SITE_INPUTS,
     stems = page_stems(manifest)
     mode = redirect_mode(config)        # site.toml "redirects"
     if clean:
-        clean_out(site, build_dirs=("output",))
+        clean_out(site, build_dirs=("output", "cache"))
     (site / "content").mkdir(parents=True, exist_ok=True)
     covers = Covers(archive, manifest)
 
@@ -259,7 +273,7 @@ def build_site(archive: Path, out=None, inputs=DEFAULT_SITE_INPUTS,
 
     pages = export_content(archive, site, manifest, stems, front_matter,
                            escape=attach_images,
-                           placer=ImagePlacer(cache, config),
+                           placer=ImagePlacer(cache, config, masters=True),
                            transform=figure_directives, covers=covers)
 
     # the header logo and the tab icon, shipped through the theme's
